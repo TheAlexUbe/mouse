@@ -1,0 +1,40 @@
+name: Build Windows Release
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install LLVM (Required for FRB)
+        run: choco install llvm -y
+
+      - name: Install FRB Codegen
+        run: cargo install flutter_rust_bridge_codegen --version 2.8.0 --locked
+
+      - name: Flutter Pub Get
+        run: flutter pub get
+
+      - name: Generate Bridge Code
+        run: flutter_rust_bridge_codegen generate
+
+      - name: Build Windows
+        run: flutter build windows --release
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KVM-Windows-Release
+          path: build/windows/x64/release/runner/
