@@ -1,36 +1,158 @@
 use crate::api::simple::KvmEvent;
-use rdev::{simulate, Button, EventType, Key};
 
-pub fn inject_event(event: KvmEvent) {
-    let event_type = match event {
-        KvmEvent::MouseMove { x, y } => Some(EventType::MouseMove { x, y }),
-        KvmEvent::MouseButtonPress { button } => Some(EventType::ButtonPress(to_rdev_button(button))),
-        KvmEvent::MouseButtonRelease { button } => Some(EventType::ButtonRelease(to_rdev_button(button))),
-        KvmEvent::KeyPress { key } => to_rdev_key(&key).map(EventType::KeyPress),
-        KvmEvent::KeyRelease { key } => to_rdev_key(&key).map(EventType::KeyRelease),
-        KvmEvent::Wheel { delta_x, delta_y } => Some(EventType::Wheel { delta_x, delta_y }),
-    };
+#[cfg(target_os = "linux")]
+mod linux_injection {
+    use super::*;
+    use lazy_static::lazy_static;
+    use std::sync::Mutex;
+    use uinput::event::controller::Controller;
+    use uinput::event::controller::Mouse;
+    use uinput::event::relative::Relative::Position;
+    use uinput::event::relative::Position::{X, Y};
+    use uinput::Device;
 
-    if let Some(et) = event_type {
-        if let Err(e) = simulate(&et) {
-            println!("Injection error: {:?}", e);
+    lazy_static! {
+        static ref DEVICE: Mutex<Option<Device>> = Mutex::new(init_device());
+        static ref LAST_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+    }
+
+    fn init_device() -> Option<Device> {
+        uinput::default()
+            .ok()?
+            .name("KVM-Virtual-Device")
+            .ok()?
+            .event(uinput::event::Keyboard::All)
+            .ok()?
+            .event(uinput::event::controller::Controller::Mouse(uinput::event::controller::Mouse::Left))
+            .ok()?
+            .event(uinput::event::controller::Controller::Mouse(uinput::event::controller::Mouse::Middle))
+            .ok()?
+            .event(uinput::event::controller::Controller::Mouse(uinput::event::controller::Mouse::Right))
+            .ok()?
+            .event(Position(X))
+            .ok()?
+            .event(Position(Y))
+            .ok()?
+            .create()
+            .ok()
+    }
+
+    pub fn inject_event_linux(event: KvmEvent) {
+        let mut device_guard = DEVICE.lock().unwrap();
+        if let Some(ref mut device) = *device_guard {
+            match event {
+                KvmEvent::MouseMove { x, y } => {
+                    let mut last_pos = LAST_POS.lock().unwrap();
+                    let dx = (x - last_pos.0) as i32;
+                    let dy = (y - last_pos.1) as i32;
+                    let _ = device.send(X, dx);
+                    let _ = device.send(Y, dy);
+                    let _ = device.synchronize();
+                    *last_pos = (x, y);
+                }
+                KvmEvent::MouseButtonPress { button } => {
+                    if let Some(b) = to_uinput_button(button) {
+                        let _ = device.press(&b);
+                        let _ = device.synchronize();
+                    }
+                }
+                KvmEvent::MouseButtonRelease { button } => {
+                    if let Some(b) = to_uinput_button(button) {
+                        let _ = device.release(&b);
+                        let _ = device.synchronize();
+                    }
+                }
+                KvmEvent::KeyPress { key } => {
+                    if let Some(k) = to_uinput_key(&key) {
+                        let _ = device.press(&k);
+                        let _ = device.synchronize();
+                    }
+                }
+                KvmEvent::KeyRelease { key } => {
+                    if let Some(k) = to_uinput_key(&key) {
+                        let _ = device.release(&k);
+                        let _ = device.synchronize();
+                    }
+                }
+                KvmEvent::Wheel { delta_x: _, delta_y: _ } => {
+                    // Wheel implementation can be added if needed
+                }
+            }
+        }
+    }
+
+    fn to_uinput_button(button: u8) -> Option<Controller> {
+        match button {
+            1 => Some(Controller::Mouse(Mouse::Left)),
+            2 => Some(Controller::Mouse(Mouse::Middle)),
+            3 => Some(Controller::Mouse(Mouse::Right)),
+            _ => None,
+        }
+    }
+
+    fn to_uinput_key(key: &str) -> Option<uinput::event::keyboard::Key> {
+        use uinput::event::keyboard::Key;
+        match key {
+            "KeyA" => Some(Key::A), "KeyB" => Some(Key::B), "KeyC" => Some(Key::C), "KeyD" => Some(Key::D),
+            "KeyE" => Some(Key::E), "KeyF" => Some(Key::F), "KeyG" => Some(Key::G), "KeyH" => Some(Key::H),
+            "KeyI" => Some(Key::I), "KeyJ" => Some(Key::J), "KeyK" => Some(Key::K), "KeyL" => Some(Key::L),
+            "KeyM" => Some(Key::M), "KeyN" => Some(Key::N), "KeyO" => Some(Key::O), "KeyP" => Some(Key::P),
+            "KeyQ" => Some(Key::Q), "KeyR" => Some(Key::R), "KeyS" => Some(Key::S), "KeyT" => Some(Key::T),
+            "KeyU" => Some(Key::U), "KeyV" => Some(Key::V), "KeyW" => Some(Key::W), "KeyX" => Some(Key::X),
+            "KeyY" => Some(Key::Y), "KeyZ" => Some(Key::Z),
+            "Num1" => Some(Key::_1), "Num2" => Some(Key::_2), "Num3" => Some(Key::_3), "Num4" => Some(Key::_4),
+            "Num5" => Some(Key::_5), "Num6" => Some(Key::_6), "Num7" => Some(Key::_7), "Num8" => Some(Key::_8),
+            "Num9" => Some(Key::_9), "Num0" => Some(Key::_0),
+            "Space" => Some(Key::Space), "Return" => Some(Key::Enter), "Escape" => Some(Key::Esc),
+            "Backspace" => Some(Key::BackSpace), "Tab" => Some(Key::Tab),
+            "ControlLeft" => Some(Key::LeftControl), "ControlRight" => Some(Key::RightControl),
+            "ShiftLeft" => Some(Key::LeftShift), "ShiftRight" => Some(Key::RightShift),
+            "Alt" => Some(Key::LeftAlt), "AltGr" => Some(Key::RightAlt),
+            "MetaLeft" => Some(Key::LeftMeta), "MetaRight" => Some(Key::RightMeta),
+            "LeftArrow" => Some(Key::Left), "RightArrow" => Some(Key::Right),
+            "UpArrow" => Some(Key::Up), "DownArrow" => Some(Key::Down),
+            _ => None,
         }
     }
 }
 
-fn to_rdev_button(button: u8) -> Button {
-    match button {
-        1 => Button::Left,
-        2 => Button::Middle,
-        3 => Button::Right,
-        b => Button::Unknown(b),
+pub fn inject_event(event: KvmEvent) {
+    #[cfg(target_os = "linux")]
+    {
+        linux_injection::inject_event_linux(event);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        use rdev::{simulate, Button, EventType, Key};
+        let event_type = match event {
+            KvmEvent::MouseMove { x, y } => Some(EventType::MouseMove { x, y }),
+            KvmEvent::MouseButtonPress { button } => Some(EventType::ButtonPress(to_rdev_button(button))),
+            KvmEvent::MouseButtonRelease { button } => Some(EventType::ButtonRelease(to_rdev_button(button))),
+            KvmEvent::KeyPress { key } => to_rdev_key(&key).map(EventType::KeyPress),
+            KvmEvent::KeyRelease { key } => to_rdev_key(&key).map(EventType::KeyRelease),
+            KvmEvent::Wheel { delta_x, delta_y } => Some(EventType::Wheel { delta_x, delta_y }),
+        };
+
+        if let Some(et) = event_type {
+            let _ = simulate(&et);
+        }
     }
 }
 
-fn to_rdev_key(key: &str) -> Option<Key> {
-    // rdev Key is an enum, we need to match the Debug string back
-    // This is hacky but since we sent format!("{:?}", key) from capture
-    // we match it here.
+#[cfg(not(target_os = "linux"))]
+fn to_rdev_button(button: u8) -> rdev::Button {
+    match button {
+        1 => rdev::Button::Left,
+        2 => rdev::Button::Middle,
+        3 => rdev::Button::Right,
+        b => rdev::Button::Unknown(b),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn to_rdev_key(key: &str) -> Option<rdev::Key> {
+    use rdev::Key;
     match key {
         "Alt" => Some(Key::Alt),
         "AltGr" => Some(Key::AltGr),
